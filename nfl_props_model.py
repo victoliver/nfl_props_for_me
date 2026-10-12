@@ -59,14 +59,22 @@ QB_F = ["pass_att_e4","completions_e4","pass_yds_e4","pass_td_e4","dropbacks_e4"
 MARKET_RELIABILITY = {
     "anytime_td":      ("GOOD",     "Brier 0.162, AUC 0.668, overall error -0.7pp"),
     "rush_yds":        ("GOOD",     "0 of 3 lines significantly miscalibrated"),
-    "receptions":      ("GOOD",     "1 of 4 lines off; only the 4.5 line (-3.8pp)"),
+    "receptions":      ("GOOD",     "pooled RB/WR/TE; 1 of 4 lines off at 4.5 (-4.2pp), RB lines 0 of 3"),
     "two_plus_td":     ("FAIR",     "under-predicts: 3.7% modeled vs 5.3% actual"),
     "rush_att":        ("FAIR",     "1 of 3 lines off; -6.4pp at 14.5"),
-    "rec_yds":         ("FAIR",     "2 of 3 lines off; over-predicts short lines by ~5pp"),
+    "rec_yds":         ("GOOD",     "normalized (team yards x share): 7 of 27 lines off across 2024-26, mean 1.6pp"),
+    "rb_rec_yds":      ("GOOD",     "normalized: 0 of 6 lines off on 2025-26, mean 0.7pp"),
     "completions":     ("WEAK",     "under-predicts by up to 9.2pp"),
     "pass_yds":        ("WEAK",     "under-predicts by 5.7 to 8.8pp"),
     "pass_att":        ("UNRELIABLE","under-predicts by up to 13pp; do not price off this"),
 }
+# Beta dispersion (kappa) for the normalized receiving-yards model, by position group.
+# Measured 2024/2025/2026: WR/TE 8.50, 8.50, 8.60 (sd 0.05); RB 11.10, 11.40, 11.16 (sd 0.13).
+# Kappa is LOAD-BEARING: it sets both the spread AND the median of the simulated
+# distribution, so a drift shifts every modeled line in the same direction at once.
+# An 18pp calibration swing was measured at the distribution centre across kappa 4 to 32.
+KAPPA_BANDS = {"WRTE": (7.5, 9.5), "RB": (10.0, 12.5)}
+
 # Signs we expect from theory. A flip means something upstream broke.
 EXPECTED_SIGNS = {"rz_share_e4": +1, "gl_share_e4": +1, "touches_e4": +1, "implied_total": +1,
                   "snap_trend": +1, "snap_e3": +1, "games_since_td": -1, "dnp": -1}
@@ -291,6 +299,81 @@ def fit_yards(tr, F, att, yds):
         return mu, yd, capped
     return predict
 
+TEAM_F = ["t_yds_e4","t_att_e4","t_cmp_e4","t_rush_e4","t_db_e4","implied_total",
+          "team_spread","total_line","opp_implied","d_allow_e4"]
+SHARE_F = ["yds_share_e4","tgt_share_e4","wopr_e4","rec_e4","targets_e4","snap_e3",
+           "snap_trend","ay_share_e4","dnp","implied_total","team_spread"]
+
+def build_team_frame(raw, frame):
+    """Team-game passing totals with lagged features, plus each player's lagged share.
+    Team passing is modelled directly rather than via the QB: lower absolute error
+    (MAE 54 vs 66) and it avoids having to identify the starter."""
+    tg = (raw.groupby(["game_id","season","week","posteam","defteam"])
+          .agg(t_yds=("rec_yds","sum"), t_att=("pass_att","sum"), t_cmp=("completions","sum"),
+               t_rush=("rush_att","sum"), t_db=("dropbacks","sum")).reset_index())
+    ctx = (raw.groupby(["game_id","posteam"])
+           .agg(implied_total=("implied_total","first"), team_spread=("team_spread","first"),
+                total_line=("total_line","first"), opp_implied=("opp_implied","first")).reset_index())
+    tg = tg.merge(ctx, on=["game_id","posteam"], how="left").sort_values(["posteam","season","week"])
+    g = tg.groupby("posteam", group_keys=False)
+    for c in ["t_yds","t_att","t_cmp","t_rush","t_db"]:
+        tg[c+"_e4"] = g[c].apply(lambda s: s.shift(1).ewm(halflife=4, min_periods=1).mean())
+    dg = (tg.groupby(["defteam","season","week"]).agg(d_allow=("t_yds","first")).reset_index()
+          .sort_values(["defteam","season","week"]))
+    dg["d_allow_e4"] = (dg.groupby("defteam", group_keys=False)["d_allow"]
+                        .apply(lambda s: s.shift(1).ewm(halflife=4, min_periods=1).mean()))
+    tg = tg.merge(dg[["defteam","season","week","d_allow_e4"]], on=["defteam","season","week"], how="left")
+    tg["gidx"] = g.cumcount()
+    frame = frame.merge(tg[["game_id","posteam","t_yds"]], on=["game_id","posteam"], how="left")
+    frame["yds_share"] = np.where(frame.t_yds > 0, frame.rec_yds / frame.t_yds, 0.0)
+    frame = frame.sort_values(["player_id","season","week","is_pred"])
+    frame["yds_share_e4"] = (frame.groupby("player_id", group_keys=False)["yds_share"]
+                             .apply(lambda s: s.shift(1).ewm(halflife=4, min_periods=1).mean()))
+    return tg, frame
+
+def fit_rec_yards_normalized(tr, te, tg, group, rep=None):
+    """Receiving yards = team passing yards x player share of it.
+    Consistent by construction, and materially better calibrated than fitting each
+    player independently: 7 of 27 lines off vs 16 of 27, mean error 1.6pp vs 3.6pp
+    across 2024-26. The independent version was worst at the DISTRIBUTION CENTRE
+    (+5.1pp at the median), which is exactly where betting decisions get made."""
+    tv = tg[(tg.gidx >= 3) & tg.implied_total.notna() & tg[TEAM_F].notna().all(axis=1)]
+    tv = tv[tv.season.isin(tr.season.unique())]
+    if len(tv) < 200 or len(tr) < 300:
+        return None, None
+    tmed = tv[TEAM_F].median()
+    mt = sm.GLM(tv.t_yds.values, sm.add_constant(tv[TEAM_F].fillna(tmed)),
+                family=sm.families.Gaussian()).fit()
+    rsd = float(np.std(tv.t_yds.values - _a(mt.predict(sm.add_constant(tv[TEAM_F].fillna(tmed))))))
+    tt = te[["game_id","posteam"]].merge(tg[["game_id","posteam"]+TEAM_F], on=["game_id","posteam"], how="left")
+    mu_t = np.clip(_a(mt.predict(sm.add_constant(tt[TEAM_F].fillna(tmed), has_constant="add"))), 40, None)
+    s_ = tr.dropna(subset=["yds_share_e4"])
+    s_ = s_[(s_.yds_share >= 0) & (s_.yds_share <= 1)]
+    smed = s_[SHARE_F].median()
+    ys = np.clip(s_.yds_share.values, 1e-4, 1-1e-4)
+    ms = sm.GLM(ys, sm.add_constant(s_[SHARE_F].fillna(smed)), family=sm.families.Binomial()).fit()
+    mu_s = np.clip(_a(ms.predict(sm.add_constant(te[SHARE_F].fillna(smed), has_constant="add"))), 1e-4, 0.95)
+    fs = np.clip(_a(ms.predict(sm.add_constant(s_[SHARE_F].fillna(smed)))), 1e-4, 0.95)
+    # method of moments. The MLE alternative fits the full beta density and calibrates
+    # WORSE here (mean error 3.1pp vs 1.1pp) because we care about the tails of a
+    # product distribution, not the density. Do not "improve" this to MLE without retesting.
+    kappa = max(np.mean(fs*(1-fs)) / max(np.var(ys - fs), 1e-6) - 1, 1.0)
+    if rep is not None:
+        lo, hi = KAPPA_BANDS.get(group, (0, 1e9))
+        rep.note("KAPPA", f"{group} receiving-yards dispersion kappa = {kappa:.2f} "
+                          f"(expected {lo}-{hi}); team model residual sd {rsd:.0f} yds")
+        if not (lo <= kappa <= hi):
+            rep.warn("KAPPA_DRIFT",
+                     f"{group} kappa is {kappa:.2f}, outside the expected {lo}-{hi}. This parameter "
+                     f"sets where the modelled MEDIAN sits, so every receiving-yards line on the "
+                     f"board has shifted in the same direction. Treat apparent edges as the model's, "
+                     f"not the market's, until this is investigated.")
+    team_draw = np.maximum(RNG.normal(mu_t[:, None], rsd, size=(len(te), N_SIM)), 0)
+    a_ = np.clip(mu_s*kappa, 0.05, None)[:, None]
+    b_ = np.clip((1-mu_s)*kappa, 0.05, None)[:, None]
+    share_draw = RNG.beta(np.broadcast_to(a_, (len(te), N_SIM)), np.broadcast_to(b_, (len(te), N_SIM)))
+    return team_draw * share_draw, kappa
+
 def fit_td(tr, F):
     """Poisson (dispersion tested at 1.10 — NB adds nothing), lambda capped.
     The cap matters: only ~0.6% of training rows exceed lambda=1.0, so anything
@@ -468,6 +551,7 @@ def price_week(datadir, outdir, season, week, rep, as_json=False):
     frame = build_frame(datadir)
     check_data_freshness(frame, season, week, rep)
     allf, n_games = build_slate(datadir, frame, season, week, rep)
+    team_tg, allf = build_team_frame(frame, allf)
     TRN = allf[(allf.is_pred == 0) & (allf.prior_games >= MIN_PRIOR_GAMES) & allf.implied_total.notna()]
     TST = allf[(allf.is_pred == 1) & (allf.prior_games >= MIN_PRIOR_GAMES) & (allf.out_flag == 0)].copy()
     rep.say(f"Trained on {len(TRN):,} player-games; pricing {len(TST)} players across {n_games} games.")
@@ -484,6 +568,7 @@ def price_week(datadir, outdir, season, week, rep, as_json=False):
     rep.say(f"Anytime-TD ceiling this week is {100*(1-np.exp(-td_cap)):.1f}% "
             f"({american(1-np.exp(-td_cap))}); nothing prices shorter than that by design.")
 
+    # --- RB rushing (unchanged) ---
     rb_tr = TRN[(TRN.position == "RB") & (TRN.rush_att_e4 > 3)]
     rb_te = TST[(TST.position == "RB") & (TST.rush_att_e4 > 3)].copy()
     if len(rb_te) and len(rb_tr) > 300:
@@ -494,20 +579,49 @@ def price_week(datadir, outdir, season, week, rep, as_json=False):
         rb_te["RushAtt_ln"] = np.floor(st.nbinom.ppf(0.5, n_, p_)) + 0.5
         rb_te["RushAtt_o"] = [american(1 - st.nbinom.cdf(np.floor(l), n_[i], p_[i]))
                               for i, l in enumerate(rb_te.RushAtt_ln)]
+
+    # --- RECEPTIONS: one POOLED model across RB/WR/TE ---
+    # RBs take ~17% of team targets. Pooling beat separate fits on BOTH groups
+    # (RB mean error 1.98 -> 1.78pp; WR/TE 1.66 -> 1.39pp) on the 2026 holdout.
+    rec_tr = TRN[TRN.position.isin(["RB","WR","TE"]) & (TRN.targets_e4 >= 1.5)]
+    rec_te = TST[TST.position.isin(["RB","WR","TE"]) & (TST.targets_e4 >= 1.5)].copy()
+    if len(rec_te) and len(rec_tr) > 300:
+        pc, _ = fit_count(rec_tr, SKILL_F, "rec"); _, n_, p_, _ = pc(rec_te)
+        rec_te["Rec_ln"] = np.floor(st.nbinom.ppf(0.5, n_, p_)) + 0.5
+        rec_te["Rec_o"] = [american(1 - st.nbinom.cdf(np.floor(l), n_[i], p_[i]))
+                           for i, l in enumerate(rec_te.Rec_ln)]
+
+    # --- RECEIVING YARDS: normalized (team passing yards x player share) ---
+    # Replaces independent per-player fits. Validated 2024-26: 7/27 lines significantly
+    # miscalibrated vs 16/27, mean error 1.61pp vs 3.62pp. Kept position-split because
+    # the dispersion parameter differs materially (WR/TE ~8.5, RB ~11.2).
     wr_tr = TRN[TRN.position.isin(["WR","TE"]) & (TRN.targets_e4 > 2)]
     wr_te = TST[TST.position.isin(["WR","TE"]) & (TST.targets_e4 > 2)].copy()
     if len(wr_te) and len(wr_tr) > 300:
-        mu, yd, _ = fit_yards(wr_tr, SKILL_F, "rec", "rec_yds")(wr_te)
+        yd, _k = fit_rec_yards_normalized(wr_tr, wr_te, team_tg, "WRTE", rep)
+        if yd is None:
+            yd, _, _ = fit_yards(wr_tr, SKILL_F, "rec", "rec_yds")(wr_te)
+            rep.warn("NORM_FALLBACK", "not enough team history for the normalized receiving-yards "
+                                      "model; fell back to the older independent fit, which is "
+                                      "miscalibrated by about +5pp near the middle of the distribution")
         wr_te["RecYds_ln"] = np.median(yd, axis=1)
         wr_te["RecYds_o"] = [american((yd[i] > np.floor(np.median(yd[i])) - 0.5).mean()) for i in range(len(wr_te))]
-        pc, _ = fit_count(wr_tr, SKILL_F, "rec"); _, n_, p_, _ = pc(wr_te)
-        wr_te["Rec_ln"] = np.floor(st.nbinom.ppf(0.5, n_, p_)) + 0.5
-        wr_te["Rec_o"] = [american(1 - st.nbinom.cdf(np.floor(l), n_[i], p_[i]))
-                          for i, l in enumerate(wr_te.Rec_ln)]
+    rby_tr = TRN[(TRN.position == "RB") & (TRN.targets_e4 >= 1.5)]
+    rby_te = TST[(TST.position == "RB") & (TST.targets_e4 >= 1.5)].copy()
+    if len(rby_te) and len(rby_tr) > 300:
+        yd, _k = fit_rec_yards_normalized(rby_tr, rby_te, team_tg, "RB", rep)
+        if yd is None:
+            yd, _, _ = fit_yards(rby_tr, SKILL_F, "rec", "rec_yds")(rby_te)
+        rby_te["RecYds_ln"] = np.median(yd, axis=1)
+        rby_te["RecYds_o"] = [american((yd[i] > np.floor(np.median(yd[i])) - 0.5).mean()) for i in range(len(rby_te))]
 
     board = s_te
+    rec_yds_all = pd.concat([d for d in (wr_te if len(wr_te) else None,
+                                         rby_te if len(rby_te) else None) if d is not None]) \
+                  if (len(wr_te) or len(rby_te)) else wr_te
     for src, cols in [(rb_te, ["RushAtt_ln","RushAtt_o","RushYds_ln","RushYds_o"]),
-                      (wr_te, ["Rec_ln","Rec_o","RecYds_ln","RecYds_o"])]:
+                      (rec_te, ["Rec_ln","Rec_o"]),
+                      (rec_yds_all, ["RecYds_ln","RecYds_o"])]:
         have = [c for c in cols if c in src.columns]
         if len(src) and have:
             board = board.merge(src[["player_id","game_id"] + have], on=["player_id","game_id"], how="left")
@@ -568,6 +682,9 @@ def price_week(datadir, outdir, season, week, rep, as_json=False):
         r = hot.iloc[0]
         rep.say(f"Highest implied team total on the slate: {r.posteam} at {r.implied_total:.2f} "
                 f"vs {r.defteam} — the model's TD prices lean on this heavily.")
+    rep.say("A modelled line is a MEDIAN, not an expected value. On right-skewed markets "
+            "(receiving and rushing yards) the mean sits well above it, so do not read a low "
+            "yardage line as a projection of what the player will average.")
     rep.say("Modeled prices carry NO vig. Your book's number will be shorter on both sides, "
             "so a small gap is not an edge — only a large one is.")
     rep.say("Parlay construction: same-game legs from OPPOSITE teams ran 1.136x independent "
